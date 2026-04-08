@@ -1,0 +1,1 @@
+cmd_/home/seed/OS-Jackfruit/boilerplate/monitor.ko := ld -r -m elf_x86_64  -z max-page-size=0x200000  --build-id  -T ./scripts/module-common.lds -o /home/seed/OS-Jackfruit/boilerplate/monitor.ko /home/seed/OS-Jackfruit/boilerplate/monitor.o /home/seed/OS-Jackfruit/boilerplate/monitor.mod.o;  true

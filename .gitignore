@@ -6,3 +6,4 @@ engine
 memory_hog
 cpu_hog
 io_pulse
+logs/

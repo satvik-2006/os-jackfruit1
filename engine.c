@@ -137,6 +137,7 @@ typedef struct {
     char state[32];
     char rootfs[256];
     char command[256];
+int stop_requested;
 } runtime_entry_t;
 
 static runtime_entry_t runtime_table[MAX_CONTAINERS];
@@ -466,6 +467,7 @@ static void add_container(pid_t pid, const char *id, const char *rootfs, const c
             strncpy(runtime_table[i].rootfs, rootfs, sizeof(runtime_table[i].rootfs) - 1);
             strncpy(runtime_table[i].command, cmd, sizeof(runtime_table[i].command) - 1);
             strcpy(runtime_table[i].state, "running");
+runtime_table[i].stop_requested = 0;
             break;
         }
     }
@@ -480,7 +482,10 @@ static void mark_container_exit(pid_t pid)
 
     for (i = 0; i < MAX_CONTAINERS; i++) {
         if (runtime_table[i].used && runtime_table[i].pid == pid) {
-            strcpy(runtime_table[i].state, "exited");
+if (runtime_table[i].stop_requested)
+    strcpy(runtime_table[i].state, "stopped");
+else
+    strcpy(runtime_table[i].state, "exited");
         }
     }
 
@@ -537,34 +542,48 @@ static void stop_container_by_id(int fd, const char *id)
  *   - accept control requests and update container state
  *   - reap children and respond to signals
  */
-
 static int run_supervisor(const char *rootfs)
 {
     int server_fd, client_fd;
     struct sockaddr_un addr;
     char buffer[512];
+    pthread_t log_thread;
+    bounded_buffer_t log_buffer;
+    int monitor_fd;
+
+    (void)rootfs;
+
+    bounded_buffer_init(&log_buffer);
+    pthread_create(&log_thread, NULL, logging_thread, &log_buffer);
+    monitor_fd = open("/dev/container_monitor", O_RDWR);
 
     unlink(CONTROL_PATH);
 
     server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (server_fd < 0) return 1;
+    if (server_fd < 0)
+        return 1;
 
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
 
-    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) return 1;
-    if (listen(server_fd, 5) < 0) return 1;
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+        return 1;
+
+    if (listen(server_fd, 5) < 0)
+        return 1;
 
     printf("[SUPERVISOR] Running...\n");
 
     while (1) {
-pid_t dead;
-while ((dead = waitpid(-1, NULL, WNOHANG)) > 0)
-    mark_container_exit(dead);
+        pid_t dead;
+
+        while ((dead = waitpid(-1, NULL, WNOHANG)) > 0)
+            mark_container_exit(dead);
 
         client_fd = accept(server_fd, NULL, NULL);
-        if (client_fd < 0) continue;
+        if (client_fd < 0)
+            continue;
 
         memset(buffer, 0, sizeof(buffer));
         read(client_fd, buffer, sizeof(buffer) - 1);
@@ -592,24 +611,58 @@ while ((dead = waitpid(-1, NULL, WNOHANG)) > 0)
         else if (strncmp(buffer, "start ", 6) == 0) {
             char id[64], rootfs_path[256], command[256];
             pid_t pid;
+            int pipefd[2];
 
             sscanf(buffer + 6, "%63s %255s %255[^\n]", id, rootfs_path, command);
 
+            pipe(pipefd);
             pid = fork();
 
             if (pid == 0) {
-                char logfile[256];
+                close(pipefd[0]);
 
-                snprintf(logfile, sizeof(logfile), "logs/%s.log", id);
-                mkdir("logs", 0755);
-                freopen(logfile, "a", stdout);
-                freopen(logfile, "a", stderr);
+                dup2(pipefd[1], STDOUT_FILENO);
+                dup2(pipefd[1], STDERR_FILENO);
+                close(pipefd[1]);
 
                 execl("./engine", "./engine", "run", id, rootfs_path, command, NULL);
                 exit(1);
             }
 
+            close(pipefd[1]);
+
             add_container(pid, id, rootfs_path, command);
+
+            if (monitor_fd >= 0)
+                register_with_monitor(
+                    monitor_fd,
+                    id,
+                    pid,
+                    104857600,
+                    157286400
+                );
+
+            {
+                char logbuf[256];
+                int n;
+                FILE *lf;
+                char path[256];
+
+                snprintf(path, sizeof(path), "logs/%s.log", id);
+                mkdir("logs", 0755);
+
+                lf = fopen(path, "a");
+                while ((n = read(pipefd[0], logbuf, sizeof(logbuf))) > 0) {
+                    if (lf)
+                        fwrite(logbuf, 1, n, lf);
+                }
+
+                if (lf)
+                    fclose(lf);
+
+                close(pipefd[0]);
+            }
+
             dprintf(client_fd, "Started %s with PID %d\n", id, pid);
         }
 
@@ -619,6 +672,12 @@ while ((dead = waitpid(-1, NULL, WNOHANG)) > 0)
 
         close(client_fd);
     }
+
+    bounded_buffer_begin_shutdown(&log_buffer);
+    pthread_join(log_thread, NULL);
+
+    if (monitor_fd >= 0)
+        close(monitor_fd);
 
     return 0;
 }

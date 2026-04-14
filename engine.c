@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
@@ -119,6 +120,12 @@ typedef struct {
 } child_config_t;
 
 typedef struct {
+    int read_fd;
+    bounded_buffer_t *buffer;
+    char container_id[CONTAINER_ID_LEN];
+} producer_args_t;
+
+typedef struct {
     int server_fd;
     int monitor_fd;
     int should_stop;
@@ -138,10 +145,13 @@ typedef struct {
     char rootfs[256];
     char command[256];
 int stop_requested;
+time_t start_time;
+int exit_signal;
 } runtime_entry_t;
 
 static runtime_entry_t runtime_table[MAX_CONTAINERS];
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile sig_atomic_t supervisor_shutdown = 0;
 
 static void usage(const char *prog)
 {
@@ -353,6 +363,25 @@ static int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *msg)
 
     return 0;
 }
+void *producer_thread(void *arg)
+{
+    producer_args_t *pa = (producer_args_t *)arg;
+    log_item_t item;
+    ssize_t n;
+
+    memset(&item, 0, sizeof(item));
+    strncpy(item.container_id, pa->container_id,
+            sizeof(item.container_id) - 1);
+
+    while ((n = read(pa->read_fd, item.data, sizeof(item.data))) > 0) {
+        item.length = (size_t)n;
+        bounded_buffer_push(pa->buffer, &item);
+    }
+
+    close(pa->read_fd);
+    free(pa);
+    return NULL;
+}
 /*
  * TODO:
  * Implement the logging consumer thread.
@@ -398,6 +427,11 @@ int child_fn(void *arg)
 {
     child_config_t *config = (child_config_t *)arg;
 
+    if (config->nice_value != 0) {
+        if (setpriority(PRIO_PROCESS, 0, config->nice_value) != 0)
+            perror("setpriority failed");
+    }
+
     if (unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS |
                 CLONE_NEWIPC | CLONE_NEWNET) != 0) {
         perror("unshare failed");
@@ -420,7 +454,6 @@ int child_fn(void *arg)
     perror("exec failed");
     return 1;
 }
-
 int register_with_monitor(int monitor_fd,
                           const char *container_id,
                           pid_t host_pid,
@@ -459,6 +492,14 @@ static void add_container(pid_t pid, const char *id, const char *rootfs, const c
     int i;
     pthread_mutex_lock(&runtime_lock);
 
+for (i = 0; i < MAX_CONTAINERS; i++) {
+    if (runtime_table[i].used &&
+        strcmp(runtime_table[i].id, id) == 0 &&
+        strcmp(runtime_table[i].state, "running") == 0) {
+        pthread_mutex_unlock(&runtime_lock);
+        return;
+    }
+}
     for (i = 0; i < MAX_CONTAINERS; i++) {
         if (!runtime_table[i].used) {
             runtime_table[i].used = 1;
@@ -468,6 +509,8 @@ static void add_container(pid_t pid, const char *id, const char *rootfs, const c
             strncpy(runtime_table[i].command, cmd, sizeof(runtime_table[i].command) - 1);
             strcpy(runtime_table[i].state, "running");
 runtime_table[i].stop_requested = 0;
+runtime_table[i].start_time = time(NULL);
+runtime_table[i].exit_signal = 0;
             break;
         }
     }
@@ -478,20 +521,31 @@ runtime_table[i].stop_requested = 0;
 static void mark_container_exit(pid_t pid)
 {
     int i;
+    int status = 0;
+
+    waitpid(pid, &status, WNOHANG);
+
     pthread_mutex_lock(&runtime_lock);
 
     for (i = 0; i < MAX_CONTAINERS; i++) {
         if (runtime_table[i].used && runtime_table[i].pid == pid) {
-if (runtime_table[i].stop_requested)
-    strcpy(runtime_table[i].state, "stopped");
-else
-    strcpy(runtime_table[i].state, "exited");
+            if (WIFSIGNALED(status)) {
+                runtime_table[i].exit_signal = WTERMSIG(status);
+
+                if (runtime_table[i].stop_requested)
+                    strcpy(runtime_table[i].state, "stopped");
+                else
+                    strcpy(runtime_table[i].state, "killed");
+            } else {
+                strcpy(runtime_table[i].state, "exited");
+            }
+
+            break;
         }
     }
 
     pthread_mutex_unlock(&runtime_lock);
 }
-
 static void print_containers(int fd)
 {
     int i;
@@ -517,16 +571,16 @@ static void stop_container_by_id(int fd, const char *id)
     int i;
     pthread_mutex_lock(&runtime_lock);
 
-    for (i = 0; i < MAX_CONTAINERS; i++) {
-        if (runtime_table[i].used && strcmp(runtime_table[i].id, id) == 0) {
-            kill(runtime_table[i].pid, SIGTERM);
-            strcpy(runtime_table[i].state, "stopped");
-            dprintf(fd, "Stopped %s\n", id);
-            pthread_mutex_unlock(&runtime_lock);
-            return;
-        }
+for (i = 0; i < MAX_CONTAINERS; i++) {
+    if (runtime_table[i].used && strcmp(runtime_table[i].id, id) == 0) {
+        runtime_table[i].stop_requested = 1;
+        kill(runtime_table[i].pid, SIGTERM);
+        strcpy(runtime_table[i].state, "stopped");
+        dprintf(fd, "Stopped %s\n", id);
+        pthread_mutex_unlock(&runtime_lock);
+        return;
     }
-
+}
     pthread_mutex_unlock(&runtime_lock);
     dprintf(fd, "Container not found\n");
 }
@@ -542,6 +596,30 @@ static void stop_container_by_id(int fd, const char *id)
  *   - accept control requests and update container state
  *   - reap children and respond to signals
  */
+
+static void handle_supervisor_signal(int sig)
+{
+    int i;
+
+    (void)sig;
+    supervisor_shutdown = 1;
+
+    pthread_mutex_lock(&runtime_lock);
+
+    for (i = 0; i < MAX_CONTAINERS; i++) {
+        if (runtime_table[i].used &&
+            strcmp(runtime_table[i].state, "running") == 0) {
+            runtime_table[i].stop_requested = 1;
+            kill(runtime_table[i].pid, SIGTERM);
+        }
+    }
+
+    pthread_mutex_unlock(&runtime_lock);
+}
+static void handle_sigchld(int sig)
+{
+    (void)sig;
+}
 static int run_supervisor(const char *rootfs)
 {
     int server_fd, client_fd;
@@ -553,8 +631,13 @@ static int run_supervisor(const char *rootfs)
 
     (void)rootfs;
 
+    signal(SIGINT, handle_supervisor_signal);
+    signal(SIGTERM, handle_supervisor_signal);
+    signal(SIGCHLD, handle_sigchld);
+
     bounded_buffer_init(&log_buffer);
     pthread_create(&log_thread, NULL, logging_thread, &log_buffer);
+
     monitor_fd = open("/dev/container_monitor", O_RDWR);
 
     unlink(CONTROL_PATH);
@@ -575,7 +658,7 @@ static int run_supervisor(const char *rootfs)
 
     printf("[SUPERVISOR] Running...\n");
 
-    while (1) {
+    while (!supervisor_shutdown) {
         pid_t dead;
 
         while ((dead = waitpid(-1, NULL, WNOHANG)) > 0)
@@ -638,29 +721,25 @@ static int run_supervisor(const char *rootfs)
                     monitor_fd,
                     id,
                     pid,
-                    104857600,
-                    157286400
+  67108864,
+    100663296
+
                 );
 
             {
-                char logbuf[256];
-                int n;
-                FILE *lf;
-                char path[256];
+                producer_args_t *pa;
+                pthread_t prod;
 
-                snprintf(path, sizeof(path), "logs/%s.log", id);
-                mkdir("logs", 0755);
+                pa = malloc(sizeof(*pa));
+                if (pa) {
+                    pa->read_fd = pipefd[0];
+                    pa->buffer = &log_buffer;
+                    strncpy(pa->container_id, id,
+                            sizeof(pa->container_id) - 1);
 
-                lf = fopen(path, "a");
-                while ((n = read(pipefd[0], logbuf, sizeof(logbuf))) > 0) {
-                    if (lf)
-                        fwrite(logbuf, 1, n, lf);
+                    pthread_create(&prod, NULL, producer_thread, pa);
+                    pthread_detach(prod);
                 }
-
-                if (lf)
-                    fclose(lf);
-
-                close(pipefd[0]);
             }
 
             dprintf(client_fd, "Started %s with PID %d\n", id, pid);
@@ -678,6 +757,9 @@ static int run_supervisor(const char *rootfs)
 
     if (monitor_fd >= 0)
         close(monitor_fd);
+
+    close(server_fd);
+    unlink(CONTROL_PATH);
 
     return 0;
 }
@@ -812,37 +894,54 @@ static int cmd_start(int argc, char *argv[])
     strncpy(req.rootfs, argv[3], sizeof(req.rootfs) - 1);
     strncpy(req.command, argv[4], sizeof(req.command) - 1);
 
+    parse_optional_flags(&req, argc, argv, 5);
+
     return send_control_request(&req);
 }
-
 static int cmd_run(int argc, char *argv[])
 {
+    void *stack;
     pid_t pid;
     int status;
-    char command[512];
+    child_config_t cfg;
+    control_request_t req;
 
     if (argc < 5) {
         fprintf(stderr, "usage: engine run <id> <rootfs> <command>\n");
         return 1;
     }
 
-    printf("[ENGINE] Starting container %s\n", argv[2]);
+    memset(&cfg, 0, sizeof(cfg));
+    memset(&req, 0, sizeof(req));
 
-    snprintf(command, sizeof(command),
-             "chroot %s /bin/sh -c '%s'",
-             argv[3], argv[4]);
+    strncpy(cfg.id, argv[2], sizeof(cfg.id) - 1);
+    strncpy(cfg.rootfs, argv[3], sizeof(cfg.rootfs) - 1);
+    strncpy(cfg.command, argv[4], sizeof(cfg.command) - 1);
 
-    pid = fork();
+    parse_optional_flags(&req, argc, argv, 5);
+    cfg.nice_value = req.nice_value;
 
-    if (pid == 0) {
-        execl("/bin/sh", "sh", "-c", command, NULL);
-        exit(1);
+    printf("[ENGINE] Starting container %s\n", cfg.id);
+
+    stack = malloc(STACK_SIZE);
+    if (!stack)
+        return 1;
+
+    pid = clone(child_fn,
+                (char *)stack + STACK_SIZE,
+                SIGCHLD,
+                &cfg);
+
+    if (pid < 0) {
+        perror("clone");
+        free(stack);
+        return 1;
     }
 
     waitpid(pid, &status, 0);
+    free(stack);
     return 0;
 }
-
 int main(int argc, char *argv[])
 {
     if (argc < 2) {

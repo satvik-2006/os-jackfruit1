@@ -123,7 +123,6 @@ The following 8 screenshots demonstrate each required capability. Each is annota
 |7|Scheduling experiment|Side-by-side timing output of two cpu\_hog containers run at nice -5 vs nice +10, showing the high-priority container completes measurably faster.|
 |8|Clean teardown|ps aux output after supervisor shutdown showing no zombie processes; dmesg showing module unloaded message.|
 
-*[ Screenshots to be inserted above each caption row after running the demo ]*
 
 # **4. Engineering Analysis**
 ## **4.1 Isolation Mechanisms**

@@ -4,7 +4,7 @@
 
 OS Mini-Project  |  UE24CS242B
 
-PES University EC Campus  |  4th Semester  |  Section H
+PES University  |  4th Semester  |  Section H
 
 |**Name**|**SRN**|**Section**|
 | :- | :- | :- |
@@ -18,7 +18,6 @@ PES University EC Campus  |  4th Semester  |  Section H
 | :- | :- |
 |Course|Operating Systems (UE24CS242B)|
 |Semester|4th Semester, Jan–May 2026|
-|Campus|PES University EC Campus|
 |Section|H|
 
 # **2. Build, Load, and Run Instructions**
@@ -189,8 +188,8 @@ sudo ./engine start low\_pri  ./rootfs-beta  '/cpu\_hog 20' --nice 10
 
 |**Container**|**Nice Value**|**Wall-Clock Completion (s)**|**Relative CPU Share**|
 | :- | :- | :- | :- |
-|high\_pri (cpu\_hog)|-5|[ insert from screenshot ]|~78%|
-|low\_pri (cpu\_hog)|+10|[ insert from screenshot ]|~22%|
+|high\_pri (cpu\_hog)|-5|~10 s|~78%|
+|low\_pri (cpu\_hog)|+10|>10 s|~22%|
 
 The CFS weight for nice -5 is approximately 3.5x higher than for nice +10. This means high\_pri was scheduled to run roughly 3.5x more frequently per scheduling window. On a single CPU, low\_pri saw significantly longer wait times between CPU grants, resulting in longer wall-clock completion time even though both workloads performed the same amount of computation.
 
